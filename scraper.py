@@ -2,13 +2,20 @@
 scraper.py — Cairn careers page scraper.
 
 Platform detection order (fastest / most reliable first):
-  1. Greenhouse  — public REST API
-  2. Lever       — public REST API
-  3. Workday     — CX services API with full pagination
-  4. Ashby       — public posting API
-  5. SmartRecruiters — public API
-  6. Static HTML — httpx + BeautifulSoup heuristics
-  7. Playwright  — headless Chromium, full pagination support
+  1.  Greenhouse        — public REST API
+  2.  Lever             — public REST API
+  3.  Workday           — CX services API with full pagination
+  4.  Ashby             — public posting API
+  5.  SmartRecruiters   — public API
+  6.  Google Careers    — unofficial search API          [NEW]
+  7.  Rippling ATS      — public API                    [NEW]
+  8.  Recruitee         — public API                    [NEW]
+  9.  Breezy HR         — public JSON endpoint           [NEW]
+  10. Workable          — public widget API              [NEW]
+  11. Jobvite           — public API                    [NEW]
+  12. BambooHR          — static embed HTML              [NEW]
+  13. Static HTML       — httpx + BeautifulSoup heuristics
+  14. Playwright        — headless Chromium, hash-SPA + infinite scroll
 
 Detail page extraction order:
   1. Workday CX API (structured JSON description)
@@ -23,7 +30,7 @@ import concurrent.futures
 import logging
 import re
 import time
-from typing import Any
+from typing import Any, TypedDict
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -40,6 +47,12 @@ HEADERS = {
 }
 
 JobList = list[dict[str, Any]]
+
+
+class ScrapeResult(TypedDict):
+    platform: str
+    total: int
+    jobs: JobList
 
 
 def _empty_job() -> dict[str, Any]:
@@ -66,6 +79,10 @@ def _retry(fn, *args, retries: int = 3, backoff: float = 1.0, **kwargs):
                 log.warning("Attempt %d failed (%s), retrying in %.1fs", attempt + 1, exc, sleep)
                 time.sleep(sleep)
     raise last  # type: ignore[misc]
+
+
+def _make_result(platform: str, jobs: JobList, total: int | None = None) -> ScrapeResult:
+    return ScrapeResult(platform=platform, total=total if total is not None else len(jobs), jobs=jobs)
 
 
 # ---------------------------------------------------------------------------
@@ -148,15 +165,14 @@ def _scrape_lever(slug: str) -> JobList:
 
 def _is_workday(url: str) -> tuple[str, str, str] | None:
     """Return (tenant, base_url, job_path) if Workday, else None."""
-    # e.g. https://databricks.wd5.myworkdayjobs.com/en-US/careers
     m = re.search(
         r"(https?://[^/]*myworkdayjobs\.com)(?:/[a-zA-Z_-]+)?/([^/?#]+)",
         url,
     )
     if not m:
         return None
-    base = m.group(1)  # https://databricks.wd5.myworkdayjobs.com
-    job_path = m.group(2)  # careers
+    base = m.group(1)
+    job_path = m.group(2)
     t = re.search(r"//([^.]+)\.", base)
     tenant = t.group(1) if t else ""
     return tenant, base, job_path
@@ -199,7 +215,6 @@ def _scrape_workday(tenant: str, base: str, job_path: str) -> JobList:
                     job["url"] = f"{base}/en-US/{job_path}{ext}"
                 job["location"] = item.get("locationsText", "")
                 job["posted_date"] = item.get("postedOn", None)
-                # bulletFields sometimes contains department or work type
                 for field in item.get("bulletFields", []):
                     if isinstance(field, str) and not job["department"]:
                         job["department"] = field
@@ -290,16 +305,334 @@ def _scrape_smartrecruiters(company_id: str) -> JobList:
 
 
 # ---------------------------------------------------------------------------
+# Google Careers (NEW)
+# ---------------------------------------------------------------------------
+
+def _is_google_careers(url: str) -> bool:
+    return bool(
+        re.search(r"careers\.google\.com", url)
+        or re.search(r"google\.com/about/careers", url)
+    )
+
+
+def _scrape_google_careers(url: str) -> tuple[JobList, int]:
+    """Scrape via Google's unofficial jobs search API with full pagination."""
+    api = "https://careers.google.com/api/jobs/jobs-v1/search/"
+    jobs: JobList = []
+    page = 1
+    total = 0
+
+    with httpx.Client(headers=HEADERS, timeout=30, follow_redirects=True) as client:
+        while True:
+            params = {
+                "q": "",
+                "num": 100,
+                "page": page,
+                "jlo": "en_US",
+                "sort_by": "date",
+            }
+            try:
+                resp = client.get(api, params=params)
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception as exc:
+                log.warning("Google Careers API error on page %d: %s", page, exc)
+                break
+
+            if page == 1:
+                total = data.get("count", 0)
+                log.debug("Google Careers: %d total jobs", total)
+
+            items = data.get("jobs", [])
+            if not items:
+                break
+
+            for item in items:
+                job = _empty_job()
+                job["title"] = item.get("title", "")
+                job["url"] = item.get("apply_url", "")
+                locs = item.get("locations", [])
+                if isinstance(locs, list):
+                    job["location"] = "; ".join(str(l) for l in locs)
+                cats = item.get("category", [])
+                if isinstance(cats, list):
+                    job["department"] = "; ".join(str(c) for c in cats)
+                elif isinstance(cats, str):
+                    job["department"] = cats
+                parts = []
+                for field in ("description", "qualifications", "responsibilities"):
+                    val = item.get(field, "")
+                    if val:
+                        parts.append(val)
+                job["description"] = "\n\n".join(parts)
+                job["posted_date"] = item.get("publish_date", None)
+                jobs.append(job)
+
+            if not data.get("next_page"):
+                break
+            page += 1
+
+    return jobs, total
+
+
+# ---------------------------------------------------------------------------
+# Rippling ATS (NEW)
+# ---------------------------------------------------------------------------
+
+def _is_rippling(url: str) -> str | None:
+    m = re.search(r"riptide\.rippling-ats\.com/([^/?#]+)", url)
+    return m.group(1) if m else None
+
+
+def _scrape_rippling(company_slug: str) -> JobList:
+    api = "https://riptide.rippling-ats.com/api/ats/jobs/"
+    jobs: JobList = []
+
+    with httpx.Client(headers=HEADERS, timeout=30, follow_redirects=True) as client:
+        resp = client.get(api, params={"company_slug": company_slug, "status": "ACTIVE"})
+        resp.raise_for_status()
+        data = resp.json()
+
+    items = data if isinstance(data, list) else data.get("results", [])
+    for item in items:
+        job = _empty_job()
+        job["title"] = item.get("title", "") or item.get("name", "")
+        job["department"] = item.get("department", "") or item.get("team", "")
+        loc = item.get("location", {})
+        if isinstance(loc, dict):
+            parts = [loc.get("city", ""), loc.get("state", ""), loc.get("country", "")]
+            job["location"] = ", ".join(p for p in parts if p)
+        elif isinstance(loc, str):
+            job["location"] = loc
+        job_id = item.get("id", "")
+        job["url"] = (
+            f"https://riptide.rippling-ats.com/{company_slug}/position/{job_id}"
+            if job_id else ""
+        )
+        job["posted_date"] = item.get("created_at", None)
+        jobs.append(job)
+    return jobs
+
+
+# ---------------------------------------------------------------------------
+# Recruitee (NEW)
+# ---------------------------------------------------------------------------
+
+def _is_recruitee(url: str) -> str | None:
+    m = re.search(r"([^./]+)\.recruitee\.com", url)
+    return m.group(1) if m else None
+
+
+def _scrape_recruitee(slug: str) -> JobList:
+    api = f"https://api.recruitee.com/c/{slug}/positions"
+    jobs: JobList = []
+
+    with httpx.Client(headers=HEADERS, timeout=30, follow_redirects=True) as client:
+        resp = client.get(api)
+        resp.raise_for_status()
+        data = resp.json()
+
+    for item in data.get("offers", []):
+        job = _empty_job()
+        job["title"] = item.get("title", "")
+        job_slug = item.get("slug", "")
+        job["url"] = f"https://{slug}.recruitee.com/o/{job_slug}/" if job_slug else ""
+        job["department"] = item.get("department", "")
+        city = item.get("city", "")
+        country = item.get("country", "")
+        job["location"] = ", ".join(p for p in [city, country] if p)
+        job["posted_date"] = item.get("created_at", None)
+        desc_html = item.get("description", "")
+        if desc_html:
+            job["description"] = BeautifulSoup(desc_html, "html.parser").get_text(separator="\n").strip()
+        jobs.append(job)
+    return jobs
+
+
+# ---------------------------------------------------------------------------
+# Breezy HR (NEW)
+# ---------------------------------------------------------------------------
+
+def _is_breezy(url: str) -> str | None:
+    m = re.search(r"([^./]+)\.breezy\.hr", url)
+    return m.group(1) if m else None
+
+
+def _scrape_breezy(company: str) -> JobList:
+    api = f"https://{company}.breezy.hr/json"
+    jobs: JobList = []
+
+    with httpx.Client(headers=HEADERS, timeout=30, follow_redirects=True) as client:
+        resp = client.get(api)
+        resp.raise_for_status()
+        data = resp.json()
+
+    items = data if isinstance(data, list) else data.get("positions", [])
+    for item in items:
+        if item.get("state", "published") != "published":
+            continue
+        job = _empty_job()
+        job["title"] = item.get("name", "")
+        friendly = item.get("friendly_id", item.get("_id", ""))
+        job["url"] = f"https://{company}.breezy.hr/p/{friendly}" if friendly else ""
+        dept = item.get("department", {})
+        job["department"] = dept.get("name", "") if isinstance(dept, dict) else str(dept or "")
+        loc = item.get("location", {})
+        if isinstance(loc, dict):
+            job["location"] = loc.get("name", "")
+        elif isinstance(loc, str):
+            job["location"] = loc
+        job["posted_date"] = item.get("creation_date", None)
+        desc_html = item.get("description", "")
+        if desc_html:
+            job["description"] = BeautifulSoup(desc_html, "html.parser").get_text(separator="\n").strip()
+        jobs.append(job)
+    return jobs
+
+
+# ---------------------------------------------------------------------------
+# Workable (NEW)
+# ---------------------------------------------------------------------------
+
+def _is_workable(url: str) -> str | None:
+    m = re.search(r"apply\.workable\.com/([^/?#]+)", url)
+    return m.group(1) if m else None
+
+
+def _scrape_workable(company: str) -> JobList:
+    api = f"https://apply.workable.com/api/v1/widget/accounts/{company}/jobs"
+    jobs: JobList = []
+
+    with httpx.Client(headers=HEADERS, timeout=30, follow_redirects=True) as client:
+        resp = client.get(api)
+        resp.raise_for_status()
+        data = resp.json()
+
+    for item in data.get("results", []):
+        job = _empty_job()
+        job["title"] = item.get("title", "")
+        shortcode = item.get("shortcode", "")
+        job["url"] = f"https://apply.workable.com/{company}/j/{shortcode}/" if shortcode else ""
+        job["department"] = item.get("department", "")
+        loc = item.get("location", {})
+        if isinstance(loc, dict):
+            parts = [loc.get("city", ""), loc.get("region", ""), loc.get("country", "")]
+            job["location"] = ", ".join(p for p in parts if p)
+        job["posted_date"] = item.get("published_on", None)
+        desc_html = item.get("description", "")
+        if desc_html:
+            job["description"] = BeautifulSoup(desc_html, "html.parser").get_text(separator="\n").strip()
+        jobs.append(job)
+    return jobs
+
+
+# ---------------------------------------------------------------------------
+# Jobvite (NEW)
+# ---------------------------------------------------------------------------
+
+def _is_jobvite(url: str) -> str | None:
+    m = re.search(r"jobs\.jobvite\.com/([^/?#]+)", url)
+    return m.group(1) if m else None
+
+
+def _scrape_jobvite(company_id: str) -> JobList:
+    api = f"https://api.jobvite.com/api/v2/{company_id}/position"
+    jobs: JobList = []
+
+    with httpx.Client(headers=HEADERS, timeout=30, follow_redirects=True) as client:
+        resp = client.get(api, params={"jobStatus": "Open", "start": 0, "count": 500})
+        resp.raise_for_status()
+        data = resp.json()
+
+    for item in data.get("position", []):
+        job = _empty_job()
+        job["title"] = item.get("title", "")
+        job["url"] = item.get("jobApplyUrl", "") or item.get("jobUrl", "")
+        job["department"] = item.get("category", "")
+        loc = item.get("location", "")
+        if isinstance(loc, str):
+            job["location"] = loc
+        elif isinstance(loc, dict):
+            city = loc.get("city", "")
+            state = loc.get("state", "")
+            job["location"] = ", ".join(p for p in [city, state] if p)
+        job["posted_date"] = item.get("date", None)
+        desc_html = item.get("description", "")
+        if desc_html:
+            job["description"] = BeautifulSoup(desc_html, "html.parser").get_text(separator="\n").strip()
+        jobs.append(job)
+    return jobs
+
+
+# ---------------------------------------------------------------------------
+# BambooHR (NEW)
+# ---------------------------------------------------------------------------
+
+def _is_bamboohr(url: str) -> str | None:
+    m = re.search(r"([^./]+)\.bamboohr\.com", url)
+    return m.group(1) if m else None
+
+
+def _scrape_bamboohr(company: str) -> JobList:
+    """Scrape BambooHR static embed widget — no JS rendering needed."""
+    embed_url = f"https://{company}.bamboohr.com/jobs/embed2/"
+    with httpx.Client(headers=HEADERS, timeout=30, follow_redirects=True) as client:
+        resp = client.get(embed_url)
+        resp.raise_for_status()
+        html = resp.text
+
+    soup = BeautifulSoup(html, "html.parser")
+    jobs: JobList = []
+    seen: set[str] = set()
+
+    # BambooHR embed: <li class="jss-jobs-list__item"> or <div class="BambooHR-ATS-Jobs-Item">
+    for li in soup.select(
+        "li[class*='jobs-list'], li[class*='jss-jobs-list'], "
+        "div[class*='BambooHR-ATS-Jobs-Item'], div[class*='jobs-listing-item']"
+    ):
+        job = _empty_job()
+        a = li.find("a", href=True)
+        if a:
+            job["title"] = a.get_text(strip=True)
+            href = a.get("href", "")
+            job["url"] = urljoin(f"https://{company}.bamboohr.com", href)
+        for span in li.find_all(["span", "div", "li"]):
+            text = span.get_text(strip=True)
+            low = text.lower()
+            if not job["location"] and any(kw in low for kw in _LOCATION_KEYWORDS):
+                job["location"] = text
+            elif not job["department"] and any(kw in low for kw in _DEPT_KEYWORDS):
+                job["department"] = text
+        if job["title"] and job["url"] not in seen:
+            seen.add(job["url"])
+            jobs.append(job)
+
+    # Fallback: any anchor pointing to /jobs/{id}/view
+    if not jobs:
+        for a in soup.find_all("a", href=True):
+            href = a.get("href", "")
+            if "/jobs/" in href:
+                title = a.get_text(strip=True)
+                full_url = urljoin(f"https://{company}.bamboohr.com", href)
+                if title and full_url not in seen:
+                    job = _empty_job()
+                    job["title"] = title
+                    job["url"] = full_url
+                    seen.add(full_url)
+                    jobs.append(job)
+
+    return jobs
+
+
+# ---------------------------------------------------------------------------
 # Static scraper (httpx + BeautifulSoup)
 # ---------------------------------------------------------------------------
 
-# Keyword patterns used to identify job-related anchors in fallback mode
 _JOB_PATH_KEYWORDS = (
     "/job", "/career", "/position", "/opening", "/role",
     "/posting", "/vacancy", "/apply", "/jobs/",
 )
 
-# CSS selectors tried in order before falling back to all anchors
 _JOB_SELECTORS = [
     "a[href*='/job']",
     "a[href*='/career']",
@@ -351,7 +684,6 @@ def _scrape_static(url: str) -> JobList:
 def _parse_html_jobs(html: str, base_url: str) -> JobList:
     soup = BeautifulSoup(html, "html.parser")
 
-    # Strip navigation noise before scanning for jobs
     for tag in soup.select(
         "nav, header, footer, [role='navigation'], "
         "[class*='sidebar'], [class*='nav-'], [class*='menu']"
@@ -368,7 +700,6 @@ def _parse_html_jobs(html: str, base_url: str) -> JobList:
                 seen_urls.add(job["url"])
                 jobs.append(job)
 
-    # Fallback: anchors whose path looks like a job posting
     if not jobs:
         for a in soup.find_all("a", href=True):
             text = a.get_text(strip=True)
@@ -416,10 +747,9 @@ def _extract_job_from_element(el: Any, base_url: str) -> dict[str, Any] | None:
 
 
 # ---------------------------------------------------------------------------
-# Playwright scraper (JS-rendered pages, full pagination)
+# Playwright scraper (improved: hash-SPA + infinite scroll + click pagination)
 # ---------------------------------------------------------------------------
 
-# Ordered list of pagination button selectors
 _PAGINATION_SELECTORS = [
     "button:has-text('Load more')",
     "button:has-text('Show more')",
@@ -440,7 +770,6 @@ _PAGINATION_SELECTORS = [
     "[class*='pagination'] [class*='next']",
 ]
 
-# Cookie/consent banner dismissal (tried once at page load)
 _CONSENT_SELECTORS = [
     "button:has-text('Accept all')",
     "button:has-text('Accept cookies')",
@@ -463,6 +792,14 @@ async def _scrape_playwright_async(url: str) -> JobList:
             "playwright is not installed. Run: pip install playwright && playwright install chromium"
         )
 
+    # Hash-fragment SPA: split URL so we can navigate base then push the route
+    hash_fragment: str | None = None
+    base_url = url
+    if "#" in url:
+        base_url, frag = url.split("#", 1)
+        hash_fragment = frag
+        log.debug("Hash-SPA detected: base=%s fragment=#%s", base_url, frag[:60])
+
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True)
         context = await browser.new_context(
@@ -470,7 +807,18 @@ async def _scrape_playwright_async(url: str) -> JobList:
             viewport={"width": 1280, "height": 900},
         )
         page = await context.new_page()
-        await page.goto(url, wait_until="networkidle", timeout=60_000)
+
+        # Navigate base URL first
+        await page.goto(base_url, wait_until="networkidle", timeout=60_000)
+
+        # For hash-SPAs: push the client-side route and wait for re-render
+        if hash_fragment:
+            await page.evaluate(f"window.location.hash = {hash_fragment!r}")
+            await asyncio.sleep(2.0)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=10_000)
+            except Exception:
+                pass
 
         # Dismiss cookie/consent banners
         for sel in _CONSENT_SELECTORS:
@@ -483,12 +831,21 @@ async def _scrape_playwright_async(url: str) -> JobList:
             except Exception:
                 pass
 
-        # Initial scroll to trigger lazy loading
-        for _ in range(8):
-            await page.evaluate("window.scrollBy(0, window.innerHeight)")
-            await asyncio.sleep(0.4)
+        # Infinite scroll: scroll until page height stabilises 3 times in a row
+        last_height: int = await page.evaluate("document.body.scrollHeight")
+        stall_count = 0
+        while stall_count < 3:
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await asyncio.sleep(1.2)
+            new_height: int = await page.evaluate("document.body.scrollHeight")
+            if new_height == last_height:
+                stall_count += 1
+            else:
+                stall_count = 0
+                last_height = new_height
+        await page.evaluate("window.scrollTo(0, 0)")
 
-        # Paginate: click next/load-more up to 50 times
+        # Click-based pagination: up to 50 pages
         for _page_num in range(50):
             html_before = await page.content()
             jobs_before = len(_parse_html_jobs(html_before, url))
@@ -504,7 +861,6 @@ async def _scrape_playwright_async(url: str) -> JobList:
                             await page.wait_for_load_state("networkidle", timeout=10_000)
                         except Exception:
                             await asyncio.sleep(1.5)
-                        # Scroll new content into view
                         for _ in range(4):
                             await page.evaluate("window.scrollBy(0, window.innerHeight)")
                             await asyncio.sleep(0.3)
@@ -516,7 +872,6 @@ async def _scrape_playwright_async(url: str) -> JobList:
             if not clicked:
                 break
 
-            # Stop if no new jobs loaded after pagination click
             html_after = await page.content()
             jobs_after = len(_parse_html_jobs(html_after, url))
             if jobs_after <= jobs_before:
@@ -585,10 +940,8 @@ _DETAIL_CONTENT_SELECTORS = [
     "[id*='description']",
 ]
 
-# Minimum character count to consider static extraction successful
 _MIN_DESCRIPTION_CHARS = 300
 
-# At least one of these keywords must appear to confirm real job content
 _JOB_CONTENT_SIGNALS = {
     "responsibilities", "requirements", "qualifications", "experience",
     "skills", "you will", "you'll", "what you'll", "what you will",
@@ -618,16 +971,11 @@ def _extract_description_from_html(html: str) -> str:
             if _is_content_sufficient(text):
                 return text
 
-    # Last resort: full page text
     return soup.get_text(separator="\n").strip()
 
 
 def _scrape_workday_detail(job_url: str) -> str | None:
-    """
-    Try to fetch a Workday job description via the CX Services API.
-    Returns the description text, or None if not a Workday URL.
-    """
-    # Match: https://tenant.wd5.myworkdayjobs.com/en-US/path/job/title/id
+    """Try Workday CX API for a job detail. Returns text or None."""
     m = re.search(
         r"(https?://[^/]*myworkdayjobs\.com)/(?:[a-zA-Z_-]+/)?([^/?#]+)/job/[^/]+/([^/?#]+)",
         job_url,
@@ -688,7 +1036,7 @@ def scrape_job_detail(job_url: str) -> str:
 async def _get_html_playwright_detail_async(url: str) -> str:
     """Fetch a JS-rendered detail page with consent dismissal, scroll, and content-wait."""
     try:
-        from playwright.async_api import async_playwright, TimeoutError as PWTimeout
+        from playwright.async_api import async_playwright
     except ImportError:
         raise RuntimeError(
             "playwright is not installed. Run: pip install playwright && playwright install chromium"
@@ -702,14 +1050,12 @@ async def _get_html_playwright_detail_async(url: str) -> str:
         )
         page = await context.new_page()
 
-        # Load page — use domcontentloaded first (faster), then wait for network
         await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
         try:
             await page.wait_for_load_state("networkidle", timeout=15_000)
         except Exception:
             pass
 
-        # Dismiss consent/cookie banners
         for sel in _CONSENT_SELECTORS:
             try:
                 btn = page.locator(sel)
@@ -720,21 +1066,18 @@ async def _get_html_playwright_detail_async(url: str) -> str:
             except Exception:
                 pass
 
-        # Scroll to trigger lazy-loaded content
         for _ in range(6):
             await page.evaluate("window.scrollBy(0, window.innerHeight)")
             await asyncio.sleep(0.3)
         await page.evaluate("window.scrollTo(0, 0)")
 
-        # Wait for job content to appear
-        for sel in _DETAIL_CONTENT_SELECTORS[:8]:  # Try the most specific ones
+        for sel in _DETAIL_CONTENT_SELECTORS[:8]:
             try:
                 await page.wait_for_selector(sel, timeout=4_000)
                 break
             except Exception:
                 continue
 
-        # Final settle
         await asyncio.sleep(0.8)
 
         html = await page.content()
@@ -755,44 +1098,91 @@ def _get_html_playwright(url: str) -> str:
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def scrape_jobs(url: str) -> JobList:
+def scrape_jobs(url: str) -> ScrapeResult:
     """
     Scrape all job postings from a careers page URL.
 
+    Returns a ScrapeResult dict with:
+      - platform: detected ATS name
+      - total:    total job count reported by the source
+      - jobs:     list of job dicts
+
     Detection order:
-      1. Greenhouse API
-      2. Lever API
-      3. Workday CX API
-      4. Ashby API
-      5. SmartRecruiters API
-      6. Static HTML (httpx + BS4)
-      7. Playwright (JS-rendered, full pagination)
+      1.  Greenhouse
+      2.  Lever
+      3.  Workday
+      4.  Ashby
+      5.  SmartRecruiters
+      6.  Google Careers
+      7.  Rippling ATS
+      8.  Recruitee
+      9.  Breezy HR
+      10. Workable
+      11. Jobvite
+      12. BambooHR
+      13. Static HTML
+      14. Playwright (hash-SPA + infinite scroll)
     """
     slug = _is_greenhouse(url)
     if slug:
         log.debug("Detected Greenhouse: %s", slug)
-        return _retry(_scrape_greenhouse, slug)
+        return _make_result("greenhouse", _retry(_scrape_greenhouse, slug))
 
     slug = _is_lever(url)
     if slug:
         log.debug("Detected Lever: %s", slug)
-        return _retry(_scrape_lever, slug)
+        return _make_result("lever", _retry(_scrape_lever, slug))
 
     wd = _is_workday(url)
     if wd:
         tenant, base, job_path = wd
         log.debug("Detected Workday: tenant=%s path=%s", tenant, job_path)
-        return _retry(_scrape_workday, tenant, base, job_path)
+        return _make_result("workday", _retry(_scrape_workday, tenant, base, job_path))
 
     slug = _is_ashby(url)
     if slug:
         log.debug("Detected Ashby: %s", slug)
-        return _retry(_scrape_ashby, slug)
+        return _make_result("ashby", _retry(_scrape_ashby, slug))
 
     slug = _is_smartrecruiters(url)
     if slug:
         log.debug("Detected SmartRecruiters: %s", slug)
-        return _retry(_scrape_smartrecruiters, slug)
+        return _make_result("smartrecruiters", _retry(_scrape_smartrecruiters, slug))
+
+    if _is_google_careers(url):
+        log.debug("Detected Google Careers")
+        jobs, total = _retry(_scrape_google_careers, url)
+        return _make_result("google_careers", jobs, total)
+
+    slug = _is_rippling(url)
+    if slug:
+        log.debug("Detected Rippling ATS: %s", slug)
+        return _make_result("rippling", _retry(_scrape_rippling, slug))
+
+    slug = _is_recruitee(url)
+    if slug:
+        log.debug("Detected Recruitee: %s", slug)
+        return _make_result("recruitee", _retry(_scrape_recruitee, slug))
+
+    slug = _is_breezy(url)
+    if slug:
+        log.debug("Detected Breezy HR: %s", slug)
+        return _make_result("breezy", _retry(_scrape_breezy, slug))
+
+    slug = _is_workable(url)
+    if slug:
+        log.debug("Detected Workable: %s", slug)
+        return _make_result("workable", _retry(_scrape_workable, slug))
+
+    slug = _is_jobvite(url)
+    if slug:
+        log.debug("Detected Jobvite: %s", slug)
+        return _make_result("jobvite", _retry(_scrape_jobvite, slug))
+
+    slug = _is_bamboohr(url)
+    if slug:
+        log.debug("Detected BambooHR: %s", slug)
+        return _make_result("bamboohr", _retry(_scrape_bamboohr, slug))
 
     # Generic: try static first, fall back to Playwright
     try:
@@ -805,5 +1195,6 @@ def scrape_jobs(url: str) -> JobList:
     if len(jobs) < 3:
         log.debug("Too few jobs from static (%d), trying Playwright", len(jobs))
         jobs = _scrape_playwright(url)
+        return _make_result("playwright", jobs)
 
-    return jobs
+    return _make_result("static_html", jobs)

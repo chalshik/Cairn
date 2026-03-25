@@ -59,16 +59,24 @@ def scrape_jobs(url: str) -> str:
     """
     Scrape all job postings from a company careers page.
 
-    Supports Greenhouse, Lever, Workday, and generic HTML career pages.
-    Returns a JSON array of job objects with fields:
-    title, department, location, url, description, posted_date.
+    Supports Greenhouse, Lever, Workday, Ashby, SmartRecruiters, Google Careers,
+    Rippling ATS, Recruitee, Breezy HR, Workable, Jobvite, BambooHR, and generic
+    HTML / JS-rendered career pages.
+
+    Returns a JSON object with:
+      - platform:  detected ATS name (e.g. "greenhouse", "google_careers", "playwright")
+      - total:     total job count reported by the source (may exceed jobs list length)
+      - jobs:      array of job objects with fields:
+                   title, department, location, url, description, posted_date
+
+    Pass the full response object directly to filter_jobs — it accepts both formats.
 
     Args:
-        url: The full URL of the careers page (e.g. https://boards.greenhouse.io/stripe)
+        url: The full URL of the careers page
     """
-    raw = _scrape_jobs(url)
-    jobs = process_jobs(raw)
-    return json.dumps(jobs, ensure_ascii=False, indent=2)
+    result = _scrape_jobs(url)
+    result["jobs"] = process_jobs(result["jobs"])
+    return json.dumps(result, ensure_ascii=False, indent=2)
 
 
 # ---------------------------------------------------------------------------
@@ -81,18 +89,40 @@ def filter_jobs(jobs: str, keyword: str) -> str:
     Filter a list of job postings by keyword.
 
     Matches against title, department, location, and description.
-    Supports multi-word queries — all words must be present.
+    Supports advanced query syntax:
+      - Multi-word:        "senior engineer"  (all words must be present)
+      - Exact phrase:      "staff engineer"   (quoted)
+      - Field-specific:    title:backend  location:remote  dept:engineering
+      - Exclusion:         -manager  -"team lead"
+
+    Accepts either a raw JSON array of jobs OR the full scrape_jobs output object
+    (with platform/total/jobs fields) — both formats work transparently.
 
     Args:
-        jobs:    JSON array of job objects (output of scrape_jobs).
-        keyword: Search term(s), e.g. "senior engineer remote" or "design berlin".
+        jobs:    Output from scrape_jobs (object or array).
+        keyword: Search term(s), e.g. "senior engineer remote" or "title:backend -manager".
     """
     try:
-        job_list: list[dict[str, Any]] = json.loads(jobs)
+        parsed = json.loads(jobs)
     except json.JSONDecodeError as exc:
         return json.dumps({"error": f"Invalid jobs JSON: {exc}"})
 
+    # Accept both {platform, total, jobs} dict and bare array
+    if isinstance(parsed, dict):
+        job_list: list[dict[str, Any]] = parsed.get("jobs", [])
+        meta = {k: v for k, v in parsed.items() if k != "jobs"}
+    else:
+        job_list = parsed
+        meta = {}
+
     results = _filter_jobs(job_list, keyword)
+
+    if meta:
+        return json.dumps(
+            {**meta, "total": len(results), "jobs": results},
+            ensure_ascii=False,
+            indent=2,
+        )
     return json.dumps(results, ensure_ascii=False, indent=2)
 
 
