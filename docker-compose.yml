@@ -1,9 +1,50 @@
 services:
   cairn:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cairn:latest
+    container_name: cairn
+
     ports:
       - "8000:8000"
+
     environment:
       CAIRN_TRANSPORT: sse
-      CAIRN_PORT: 8000
+      CAIRN_PORT: "8000"
+      PYTHONUNBUFFERED: "1"
+
+    # Restart automatically on crash; stop if manually stopped
     restart: unless-stopped
+
+    # Health check mirrors the HEALTHCHECK in the Dockerfile
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import socket; s=socket.socket(); s.settimeout(5); s.connect(('127.0.0.1', 8000)); s.close()"
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+
+    # Capped resources — enough for Chromium without starving the host
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1500M
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+
+    # Structured JSON logs with automatic rotation
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # Give the server time to finish in-flight scrapes on shutdown
+    stop_grace_period: 30s
