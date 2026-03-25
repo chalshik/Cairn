@@ -9,6 +9,11 @@ Platform detection order (fastest / most reliable first):
   5. SmartRecruiters — public API
   6. Static HTML — httpx + BeautifulSoup heuristics
   7. Playwright  — headless Chromium, full pagination support
+
+Detail page extraction order:
+  1. Workday CX API (structured JSON description)
+  2. Static HTTP + BS4 (fast path)
+  3. Playwright with consent dismissal, scroll, and content-wait
 """
 
 from __future__ import annotations
@@ -541,55 +546,196 @@ def _scrape_playwright(url: str) -> JobList:
 # Single job detail
 # ---------------------------------------------------------------------------
 
+_DETAIL_NOISE_SELECTORS = (
+    "nav, header, footer, script, style, noscript, "
+    "[role='navigation'], [role='banner'], [role='contentinfo'], "
+    "[class*='cookie'], [class*='consent'], [class*='banner'], "
+    "[class*='sidebar'], [class*='related'], [class*='recommended'], "
+    "[class*='similar-job'], [class*='share'], [class*='social'], "
+    "[class*='breadcrumb'], [id*='cookie'], [id*='consent']"
+)
+
+_DETAIL_CONTENT_SELECTORS = [
+    # Semantic / explicit
+    "[class*='job-description']",
+    "[id*='job-description']",
+    "[class*='job-details']",
+    "[id*='job-details']",
+    "[class*='job-content']",
+    "[id*='job-content']",
+    "[class*='posting-details']",
+    "[class*='posting-content']",
+    "[class*='job-posting']",
+    "[class*='career-detail']",
+    "[class*='position-detail']",
+    "[class*='role-description']",
+    # Test IDs used by React/Next apps
+    "[data-testid*='job']",
+    "[data-testid*='description']",
+    "[data-automation*='job']",
+    # Generic containers
+    "article",
+    "[role='main']",
+    "main",
+    ".content",
+    "#content",
+    "#main",
+    "#main-content",
+    "[class*='description']",
+    "[id*='description']",
+]
+
+# Minimum character count to consider static extraction successful
+_MIN_DESCRIPTION_CHARS = 300
+
+
+def _is_content_sufficient(text: str) -> bool:
+    return len(text.strip()) >= _MIN_DESCRIPTION_CHARS
+
+
+def _extract_description_from_html(html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup.select(_DETAIL_NOISE_SELECTORS):
+        tag.decompose()
+
+    for sel in _DETAIL_CONTENT_SELECTORS:
+        el = soup.select_one(sel)
+        if el:
+            text = el.get_text(separator="\n").strip()
+            if _is_content_sufficient(text):
+                return text
+
+    # Last resort: full page text
+    return soup.get_text(separator="\n").strip()
+
+
+def _scrape_workday_detail(job_url: str) -> str | None:
+    """
+    Try to fetch a Workday job description via the CX Services API.
+    Returns the description text, or None if not a Workday URL.
+    """
+    # Match: https://tenant.wd5.myworkdayjobs.com/en-US/path/job/title/id
+    m = re.search(
+        r"(https?://[^/]*myworkdayjobs\.com)/(?:[a-zA-Z_-]+/)?([^/?#]+)/job/[^/]+/([^/?#]+)",
+        job_url,
+    )
+    if not m:
+        return None
+    base, job_path, job_id = m.group(1), m.group(2), m.group(3)
+    t = re.search(r"//([^.]+)\.", base)
+    if not t:
+        return None
+    tenant = t.group(1)
+    api = f"{base}/wday/cxs/{tenant}/{job_path}/jobs/{job_id}"
+    try:
+        with httpx.Client(headers={**HEADERS, "Accept": "application/json"}, timeout=30, follow_redirects=True) as client:
+            resp = client.get(api)
+            resp.raise_for_status()
+            data = resp.json()
+        desc_html = (
+            data.get("jobPostingInfo", {}).get("jobDescription", "")
+            or data.get("jobDescription", "")
+        )
+        if desc_html:
+            return BeautifulSoup(desc_html, "html.parser").get_text(separator="\n").strip()
+    except Exception as exc:
+        log.debug("Workday detail API failed for %s: %s", job_url, exc)
+    return None
+
+
 def scrape_job_detail(job_url: str) -> str:
     """Fetch and extract the full description of a single job posting."""
+    # 1. Try Workday API (structured, no JS needed)
+    wd_desc = _scrape_workday_detail(job_url)
+    if wd_desc and _is_content_sufficient(wd_desc):
+        return wd_desc
+
+    # 2. Try fast static fetch
     html: str | None = None
     try:
         with httpx.Client(headers=HEADERS, timeout=30, follow_redirects=True) as client:
             resp = client.get(job_url)
-            # Fall back to Playwright on bot-protection responses
-            if resp.status_code in (403, 429):
-                html = _get_html_playwright(job_url)
-            else:
+            if resp.status_code not in (403, 429):
                 resp.raise_for_status()
                 html = resp.text
     except Exception:
-        html = _get_html_playwright(job_url)
+        pass
 
-    soup = BeautifulSoup(html, "html.parser")
-    for tag in soup.select("nav, header, footer, script, style, [role='navigation']"):
-        tag.decompose()
+    if html:
+        text = _extract_description_from_html(html)
+        if _is_content_sufficient(text):
+            return text
+        log.debug("Static detail insufficient (%d chars), falling back to Playwright", len(text.strip()))
 
-    for sel in [
-        "[class*='job-description']",
-        "[id*='job-description']",
-        "[class*='posting-details']",
-        "[class*='job-details']",
-        "[class*='description']",
-        "[id*='description']",
-        "article",
-        "main",
-        ".content",
-        "#content",
-    ]:
-        el = soup.select_one(sel)
-        if el:
-            return el.get_text(separator="\n").strip()
+    # 3. Playwright with full JS rendering
+    html = _get_html_playwright_detail(job_url)
+    return _extract_description_from_html(html)
 
-    return soup.get_text(separator="\n").strip()
+
+async def _get_html_playwright_detail_async(url: str) -> str:
+    """Fetch a JS-rendered detail page with consent dismissal, scroll, and content-wait."""
+    try:
+        from playwright.async_api import async_playwright, TimeoutError as PWTimeout
+    except ImportError:
+        raise RuntimeError(
+            "playwright is not installed. Run: pip install playwright && playwright install chromium"
+        )
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        context = await browser.new_context(
+            extra_http_headers=HEADERS,
+            viewport={"width": 1280, "height": 900},
+        )
+        page = await context.new_page()
+
+        # Load page — use domcontentloaded first (faster), then wait for network
+        await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=15_000)
+        except Exception:
+            pass
+
+        # Dismiss consent/cookie banners
+        for sel in _CONSENT_SELECTORS:
+            try:
+                btn = page.locator(sel)
+                if await btn.count() > 0:
+                    await btn.first.click(timeout=3_000)
+                    await asyncio.sleep(0.5)
+                    break
+            except Exception:
+                pass
+
+        # Scroll to trigger lazy-loaded content
+        for _ in range(6):
+            await page.evaluate("window.scrollBy(0, window.innerHeight)")
+            await asyncio.sleep(0.3)
+        await page.evaluate("window.scrollTo(0, 0)")
+
+        # Wait for job content to appear
+        for sel in _DETAIL_CONTENT_SELECTORS[:8]:  # Try the most specific ones
+            try:
+                await page.wait_for_selector(sel, timeout=4_000)
+                break
+            except Exception:
+                continue
+
+        # Final settle
+        await asyncio.sleep(0.8)
+
+        html = await page.content()
+        await browser.close()
+    return html
+
+
+def _get_html_playwright_detail(url: str) -> str:
+    return _run_async(_get_html_playwright_detail_async(url))
 
 
 def _get_html_playwright(url: str) -> str:
-    async def _inner() -> str:
-        from playwright.async_api import async_playwright
-        async with async_playwright() as pw:
-            browser = await pw.chromium.launch(headless=True)
-            page = await browser.new_page(extra_http_headers=HEADERS)
-            await page.goto(url, wait_until="networkidle", timeout=60_000)
-            html = await page.content()
-            await browser.close()
-            return html
-    return _run_async(_inner())
+    """Legacy alias — kept for backwards compatibility."""
+    return _get_html_playwright_detail(url)
 
 
 # ---------------------------------------------------------------------------
