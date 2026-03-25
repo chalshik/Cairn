@@ -13,6 +13,7 @@ from __future__ import annotations
 import re
 import json
 import asyncio
+import concurrent.futures
 from typing import Any
 from urllib.parse import urlparse, urljoin
 
@@ -271,8 +272,15 @@ async def _scrape_playwright_async(url: str) -> JobList:
     return _parse_html_jobs(html, url)
 
 
+def _run_async(coro):
+    """Run an async coroutine safely regardless of whether an event loop is running."""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(asyncio.run, coro)
+        return future.result()
+
+
 def _scrape_playwright(url: str) -> JobList:
-    return asyncio.run(_scrape_playwright_async(url))
+    return _run_async(_scrape_playwright_async(url))
 
 
 # ---------------------------------------------------------------------------
@@ -323,7 +331,7 @@ def _get_html_playwright(url: str) -> str:
             html = await page.content()
             await browser.close()
             return html
-    return asyncio.run(_inner())
+    return _run_async(_inner())
 
 
 # ---------------------------------------------------------------------------
