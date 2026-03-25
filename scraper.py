@@ -588,9 +588,22 @@ _DETAIL_CONTENT_SELECTORS = [
 # Minimum character count to consider static extraction successful
 _MIN_DESCRIPTION_CHARS = 300
 
+# At least one of these keywords must appear to confirm real job content
+_JOB_CONTENT_SIGNALS = {
+    "responsibilities", "requirements", "qualifications", "experience",
+    "skills", "you will", "you'll", "what you'll", "what you will",
+    "we are looking", "we're looking", "role overview", "about the role",
+    "about this role", "job description", "what you bring", "who you are",
+    "minimum qualifications", "preferred qualifications", "basic qualifications",
+    "must have", "nice to have", "duties", "job summary", "position summary",
+}
+
 
 def _is_content_sufficient(text: str) -> bool:
-    return len(text.strip()) >= _MIN_DESCRIPTION_CHARS
+    if len(text.strip()) < _MIN_DESCRIPTION_CHARS:
+        return False
+    low = text.lower()
+    return any(signal in low for signal in _JOB_CONTENT_SIGNALS)
 
 
 def _extract_description_from_html(html: str) -> str:
