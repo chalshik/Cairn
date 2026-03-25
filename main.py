@@ -38,6 +38,7 @@ from parser import process_jobs, filter_jobs as _filter_jobs
 # Server setup
 # ---------------------------------------------------------------------------
 
+_port = int(os.environ.get("CAIRN_PORT", "8000"))
 mcp = FastMCP(
     name="cairn",
     instructions=(
@@ -45,6 +46,8 @@ mcp = FastMCP(
         "Use scrape_jobs to fetch all jobs from a URL, filter_jobs to narrow results "
         "by keyword, and get_job_detail to fetch the full description of a single posting."
     ),
+    host="0.0.0.0",
+    port=_port,
 )
 
 # ---------------------------------------------------------------------------
@@ -122,7 +125,6 @@ def get_job_detail(job_url: str) -> str:
 if __name__ == "__main__":
     transport = os.environ.get("CAIRN_TRANSPORT", "stdio")
     if transport == "sse":
-        port = int(os.environ.get("CAIRN_PORT", "8000"))
-        mcp.run(transport="sse", host="0.0.0.0", port=port)
+        mcp.run(transport="sse")
     else:
         mcp.run(transport="stdio")
