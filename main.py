@@ -6,16 +6,27 @@ Exposes three MCP tools:
   • filter_jobs(jobs, keyword)  — filter a job list by keyword
   • get_job_detail(job_url)     — fetch the full description of a single posting
 
-Run:
+Transport is selected via the CAIRN_TRANSPORT environment variable:
+  stdio  (default) — for local use / Claude Code CLI
+  sse              — HTTP+SSE server, used by Docker (default in container)
+
+Run locally:
     python main.py
 
-Register with Claude Code:
+Run as HTTP server:
+    CAIRN_TRANSPORT=sse CAIRN_PORT=8000 python main.py
+
+Register with Claude Code (local):
     claude mcp add cairn -- python main.py
+
+Register with Claude Code (Docker / SSE):
+    claude mcp add --transport sse cairn http://localhost:8000/sse
 """
 
 from __future__ import annotations
 
 import json
+import os
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -109,4 +120,9 @@ def get_job_detail(job_url: str) -> str:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    mcp.run(transport="stdio")
+    transport = os.environ.get("CAIRN_TRANSPORT", "stdio")
+    if transport == "sse":
+        port = int(os.environ.get("CAIRN_PORT", "8000"))
+        mcp.run(transport="sse", host="0.0.0.0", port=port)
+    else:
+        mcp.run(transport="stdio")

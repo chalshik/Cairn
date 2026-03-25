@@ -105,24 +105,36 @@ List all jobs in Berlin at Contentful.
 
 ## Docker
 
-### Build
+Inside the container Cairn runs as an **HTTP+SSE server** on port 8000,
+so it stays alive and accepts connections like a real service.
+
+### Start with Docker Compose (recommended)
+
+```bash
+docker compose up --build
+```
+
+The server will be available at `http://localhost:8000/sse`.
+
+### Or build and run manually
 
 ```bash
 docker build -t cairn .
+docker run -p 8000:8000 cairn
 ```
 
-### Register with Claude Code (Docker)
-
-Claude Code communicates over stdio, so pass `-i` to keep stdin open:
+### Register with Claude Code (SSE transport)
 
 ```bash
-claude mcp add cairn -- docker run -i --rm cairn
+claude mcp add --transport sse cairn http://localhost:8000/sse
 ```
 
-### Run manually (for testing)
+### Use stdio transport instead (no HTTP)
+
+If you prefer the original stdio mode (process managed by Claude Code):
 
 ```bash
-docker run -i --rm cairn
+claude mcp add cairn -- docker run -i --rm -e CAIRN_TRANSPORT=stdio cairn
 ```
 
 ---

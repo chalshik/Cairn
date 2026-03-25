@@ -19,4 +19,10 @@ RUN playwright install chromium --with-deps
 
 COPY . .
 
+# Default to SSE transport so the container runs as a real HTTP server
+ENV CAIRN_TRANSPORT=sse
+ENV CAIRN_PORT=8000
+
+EXPOSE 8000
+
 CMD ["python", "main.py"]
