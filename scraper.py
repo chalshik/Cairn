@@ -1,28 +1,30 @@
 """
-scraper.py — Careers page scraper for Cairn.
+scraper.py — Cairn careers page scraper.
 
-Strategy (in order):
-1. Greenhouse public API (fastest, lossless)
-2. Lever public API
-3. httpx + BeautifulSoup for static HTML
-4. Playwright for JS-rendered pages (Workday, custom React/Vue boards)
+Platform detection order (fastest / most reliable first):
+  1. Greenhouse  — public REST API
+  2. Lever       — public REST API
+  3. Workday     — CX services API with full pagination
+  4. Ashby       — public posting API
+  5. SmartRecruiters — public API
+  6. Static HTML — httpx + BeautifulSoup heuristics
+  7. Playwright  — headless Chromium, full pagination support
 """
 
 from __future__ import annotations
 
-import re
-import json
 import asyncio
 import concurrent.futures
+import logging
+import re
+import time
 from typing import Any
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+log = logging.getLogger(__name__)
 
 HEADERS = {
     "User-Agent": (
@@ -46,12 +48,26 @@ def _empty_job() -> dict[str, Any]:
     }
 
 
+def _retry(fn, *args, retries: int = 3, backoff: float = 1.0, **kwargs):
+    """Call fn(*args, **kwargs) up to `retries` times with exponential backoff."""
+    last: Exception | None = None
+    for attempt in range(retries):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            last = exc
+            if attempt < retries - 1:
+                sleep = backoff * (2 ** attempt)
+                log.warning("Attempt %d failed (%s), retrying in %.1fs", attempt + 1, exc, sleep)
+                time.sleep(sleep)
+    raise last  # type: ignore[misc]
+
+
 # ---------------------------------------------------------------------------
 # Greenhouse
 # ---------------------------------------------------------------------------
 
 def _is_greenhouse(url: str) -> str | None:
-    """Return the board slug if URL points to a Greenhouse board, else None."""
     patterns = [
         r"boards\.greenhouse\.io/([^/?#]+)",
         r"greenhouse\.io/([^/?#]+)",
@@ -77,21 +93,14 @@ def _scrape_greenhouse(slug: str) -> JobList:
         job["title"] = item.get("title", "")
         job["url"] = item.get("absolute_url", "")
         job["posted_date"] = item.get("updated_at", None)
-
-        # Location
         loc = item.get("location", {})
         job["location"] = loc.get("name", "") if isinstance(loc, dict) else str(loc)
-
-        # Department — may be list or single
         depts = item.get("departments", [])
         if depts:
             job["department"] = depts[0].get("name", "") if isinstance(depts[0], dict) else str(depts[0])
-
-        # Description from content block
         content = item.get("content", "")
         if content:
             job["description"] = BeautifulSoup(content, "html.parser").get_text(separator="\n").strip()
-
         jobs.append(job)
     return jobs
 
@@ -120,17 +129,158 @@ def _scrape_lever(slug: str) -> JobList:
         job["department"] = item.get("categories", {}).get("team", "")
         job["location"] = item.get("categories", {}).get("location", "")
         job["posted_date"] = str(item.get("createdAt", "")) or None
-
-        # Description — plain text from lists
-        desc_parts: list[str] = []
-        for block in item.get("descriptionPlain", "").split("\n"):
-            desc_parts.append(block)
-        job["description"] = "\n".join(desc_parts).strip()
+        job["description"] = item.get("descriptionPlain", "").strip()
         if not job["description"]:
             raw = item.get("description", "")
             job["description"] = BeautifulSoup(raw, "html.parser").get_text(separator="\n").strip()
-
         jobs.append(job)
+    return jobs
+
+
+# ---------------------------------------------------------------------------
+# Workday
+# ---------------------------------------------------------------------------
+
+def _is_workday(url: str) -> tuple[str, str, str] | None:
+    """Return (tenant, base_url, job_path) if Workday, else None."""
+    # e.g. https://databricks.wd5.myworkdayjobs.com/en-US/careers
+    m = re.search(
+        r"(https?://[^/]*myworkdayjobs\.com)(?:/[a-zA-Z_-]+)?/([^/?#]+)",
+        url,
+    )
+    if not m:
+        return None
+    base = m.group(1)  # https://databricks.wd5.myworkdayjobs.com
+    job_path = m.group(2)  # careers
+    t = re.search(r"//([^.]+)\.", base)
+    tenant = t.group(1) if t else ""
+    return tenant, base, job_path
+
+
+def _scrape_workday(tenant: str, base: str, job_path: str) -> JobList:
+    """Scrape via Workday CX Services API with full pagination."""
+    api = f"{base}/wday/cxs/{tenant}/{job_path}/jobs"
+    headers = {**HEADERS, "Content-Type": "application/json", "Accept": "application/json"}
+    limit = 20
+    jobs: JobList = []
+    offset = 0
+    total: int | None = None
+
+    with httpx.Client(headers=headers, timeout=30, follow_redirects=True) as client:
+        while True:
+            payload = {
+                "appliedFacets": {},
+                "limit": limit,
+                "offset": offset,
+                "searchText": "",
+            }
+            resp = client.post(api, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+
+            if total is None:
+                total = data.get("total", 0)
+                log.debug("Workday %s/%s: %d total jobs", tenant, job_path, total)
+
+            postings = data.get("jobPostings", [])
+            if not postings:
+                break
+
+            for item in postings:
+                job = _empty_job()
+                job["title"] = item.get("title", "")
+                ext = item.get("externalPath", "")
+                if ext:
+                    job["url"] = f"{base}/en-US/{job_path}{ext}"
+                job["location"] = item.get("locationsText", "")
+                job["posted_date"] = item.get("postedOn", None)
+                # bulletFields sometimes contains department or work type
+                for field in item.get("bulletFields", []):
+                    if isinstance(field, str) and not job["department"]:
+                        job["department"] = field
+                jobs.append(job)
+
+            offset += len(postings)
+            if total is not None and offset >= total:
+                break
+            if len(postings) < limit:
+                break
+
+    return jobs
+
+
+# ---------------------------------------------------------------------------
+# Ashby
+# ---------------------------------------------------------------------------
+
+def _is_ashby(url: str) -> str | None:
+    m = re.search(r"jobs\.ashbyhq\.com/([^/?#]+)", url)
+    return m.group(1) if m else None
+
+
+def _scrape_ashby(slug: str) -> JobList:
+    api = "https://api.ashbyhq.com/posting-public/apiKey/getAll"
+    with httpx.Client(headers=HEADERS, timeout=30, follow_redirects=True) as client:
+        resp = client.get(api, params={"organizationHostedJobsPageName": slug})
+        resp.raise_for_status()
+        data = resp.json()
+
+    jobs: JobList = []
+    for item in data.get("results", []):
+        if not item.get("isListed", True):
+            continue
+        job = _empty_job()
+        job["title"] = item.get("title", "")
+        job["url"] = item.get("jobUrl", "")
+        job["department"] = item.get("department", "")
+        job["location"] = item.get("locationName", "")
+        job["posted_date"] = item.get("publishedDate", None)
+        desc_html = item.get("descriptionHtml", "")
+        if desc_html:
+            job["description"] = BeautifulSoup(desc_html, "html.parser").get_text(separator="\n").strip()
+        jobs.append(job)
+    return jobs
+
+
+# ---------------------------------------------------------------------------
+# SmartRecruiters
+# ---------------------------------------------------------------------------
+
+def _is_smartrecruiters(url: str) -> str | None:
+    m = re.search(r"careers\.smartrecruiters\.com/([^/?#]+)", url)
+    return m.group(1) if m else None
+
+
+def _scrape_smartrecruiters(company_id: str) -> JobList:
+    api = f"https://api.smartrecruiters.com/v1/companies/{company_id}/postings"
+    jobs: JobList = []
+    offset = 0
+    limit = 100
+
+    with httpx.Client(headers=HEADERS, timeout=30, follow_redirects=True) as client:
+        while True:
+            resp = client.get(api, params={"limit": limit, "offset": offset, "status": "PUBLIC"})
+            resp.raise_for_status()
+            data = resp.json()
+            items = data.get("content", [])
+            if not items:
+                break
+            for item in items:
+                job = _empty_job()
+                job["title"] = item.get("name", "")
+                job["url"] = item.get("ref", "")
+                dept = item.get("department") or {}
+                job["department"] = dept.get("label", "") if isinstance(dept, dict) else ""
+                loc = item.get("location") or {}
+                city = loc.get("city", "")
+                country = loc.get("country", "")
+                job["location"] = ", ".join(p for p in [city, country] if p)
+                job["posted_date"] = item.get("releasedDate", None)
+                jobs.append(job)
+            offset += len(items)
+            if len(items) < limit:
+                break
+
     return jobs
 
 
@@ -138,74 +288,109 @@ def _scrape_lever(slug: str) -> JobList:
 # Static scraper (httpx + BeautifulSoup)
 # ---------------------------------------------------------------------------
 
+# Keyword patterns used to identify job-related anchors in fallback mode
+_JOB_PATH_KEYWORDS = (
+    "/job", "/career", "/position", "/opening", "/role",
+    "/posting", "/vacancy", "/apply", "/jobs/",
+)
+
+# CSS selectors tried in order before falling back to all anchors
+_JOB_SELECTORS = [
+    "a[href*='/job']",
+    "a[href*='/career']",
+    "a[href*='/position']",
+    "a[href*='/opening']",
+    "a[href*='/role']",
+    "a[href*='/posting']",
+    "a[href*='/vacancy']",
+    "li.job",
+    "div.job",
+    "tr.job",
+    "[data-job-id]",
+    "[data-job]",
+    "[class*='job-listing']",
+    "[class*='job-item']",
+    "[class*='job-card']",
+    "[class*='career-listing']",
+    "[class*='position-item']",
+    "[class*='opening-item']",
+    "[class*='role-item']",
+]
+
+_LOCATION_KEYWORDS = {
+    "remote", "hybrid", "onsite", "on-site", "office",
+    "new york", "london", "berlin", "paris", "san francisco",
+    "seattle", "austin", "boston", "chicago", "toronto",
+    "amsterdam", "singapore", "tokyo", "sydney", "tel aviv",
+    "bangalore", "mumbai", "zürich", "zurich", "dublin",
+    "stockholm", "copenhagen", "helsinki", "warsaw", "madrid",
+    "barcelona", "rome", "milan", "vienna", "prague",
+}
+
+_DEPT_KEYWORDS = {
+    "engineering", "product", "design", "sales", "marketing",
+    "finance", "operations", "people", "legal", "data", "research",
+    "security", "infrastructure", "platform", "business", "customer",
+    "support", "recruiting", "hr", "growth", "analytics", "science",
+    "machine learning", "ai", "hardware", "firmware", "mobile",
+}
+
+
 def _scrape_static(url: str) -> JobList:
     with httpx.Client(headers=HEADERS, timeout=30, follow_redirects=True) as client:
         resp = client.get(url)
         resp.raise_for_status()
-        html = resp.text
-
-    return _parse_html_jobs(html, url)
+        return _parse_html_jobs(resp.text, url)
 
 
 def _parse_html_jobs(html: str, base_url: str) -> JobList:
     soup = BeautifulSoup(html, "html.parser")
+
+    # Strip navigation noise before scanning for jobs
+    for tag in soup.select(
+        "nav, header, footer, [role='navigation'], "
+        "[class*='sidebar'], [class*='nav-'], [class*='menu']"
+    ):
+        tag.decompose()
+
     jobs: JobList = []
-
-    # Heuristic: look for repeated anchor-or-li patterns that smell like job rows
-    # Common selectors used by career sites
-    candidate_selectors = [
-        "a[href*='job']",
-        "a[href*='career']",
-        "a[href*='position']",
-        "a[href*='opening']",
-        "a[href*='role']",
-        "li.job",
-        "div.job",
-        "tr.job",
-        "[data-job-id]",
-        "[class*='job-listing']",
-        "[class*='career-listing']",
-        "[class*='position']",
-        "[class*='opening']",
-    ]
-
     seen_urls: set[str] = set()
-    for sel in candidate_selectors:
+
+    for sel in _JOB_SELECTORS:
         for el in soup.select(sel):
             job = _extract_job_from_element(el, base_url)
-            if job and job["url"] not in seen_urls and job["title"]:
+            if job and job["title"] and job["url"] not in seen_urls:
                 seen_urls.add(job["url"])
                 jobs.append(job)
 
-    # If nothing found, fall back to ALL anchors with job-like text
+    # Fallback: anchors whose path looks like a job posting
     if not jobs:
         for a in soup.find_all("a", href=True):
             text = a.get_text(strip=True)
-            href = a["href"]
-            if len(text) < 5 or len(text) > 200:
+            if not (5 <= len(text) <= 200):
                 continue
-            full_url = urljoin(base_url, href)
+            full_url = urljoin(base_url, a["href"])
             if full_url in seen_urls:
                 continue
-            job = _empty_job()
-            job["title"] = text
-            job["url"] = full_url
-            seen_urls.add(full_url)
-            jobs.append(job)
+            parsed = urlparse(full_url)
+            if any(kw in parsed.path.lower() for kw in _JOB_PATH_KEYWORDS):
+                job = _empty_job()
+                job["title"] = text
+                job["url"] = full_url
+                seen_urls.add(full_url)
+                jobs.append(job)
 
     return jobs
 
 
 def _extract_job_from_element(el: Any, base_url: str) -> dict[str, Any] | None:
     job = _empty_job()
-    tag = el.name
 
-    if tag == "a":
+    if el.name == "a":
         job["title"] = el.get_text(strip=True)
         href = el.get("href", "")
         job["url"] = urljoin(base_url, href) if href else ""
     else:
-        # Look for a link inside the element
         a = el.find("a", href=True)
         if a:
             job["title"] = a.get_text(strip=True) or el.get_text(strip=True)
@@ -213,16 +398,12 @@ def _extract_job_from_element(el: Any, base_url: str) -> dict[str, Any] | None:
         else:
             job["title"] = el.get_text(strip=True)
 
-    # Try to extract location / department from sibling/child text nodes
-    text_nodes = [t.strip() for t in el.stripped_strings]
-    for node in text_nodes[1:]:
+    for node in list(el.stripped_strings)[1:]:
         low = node.lower()
-        if any(w in low for w in ["remote", "hybrid", "onsite", "office", "city", "new york", "london", "berlin", "paris", "san francisco"]):
-            if not job["location"]:
-                job["location"] = node
-        elif any(w in low for w in ["engineering", "product", "design", "sales", "marketing", "finance", "operations", "people", "legal"]):
-            if not job["department"]:
-                job["department"] = node
+        if not job["location"] and any(kw in low for kw in _LOCATION_KEYWORDS):
+            job["location"] = node
+        elif not job["department"] and any(kw in low for kw in _DEPT_KEYWORDS):
+            job["department"] = node
 
     if not job["title"] or len(job["title"]) > 200:
         return None
@@ -230,41 +411,114 @@ def _extract_job_from_element(el: Any, base_url: str) -> dict[str, Any] | None:
 
 
 # ---------------------------------------------------------------------------
-# Playwright scraper (JS-rendered pages)
+# Playwright scraper (JS-rendered pages, full pagination)
 # ---------------------------------------------------------------------------
+
+# Ordered list of pagination button selectors
+_PAGINATION_SELECTORS = [
+    "button:has-text('Load more')",
+    "button:has-text('Show more')",
+    "button:has-text('View more')",
+    "button:has-text('See more')",
+    "button:has-text('More jobs')",
+    "button:has-text('Load More')",
+    "button:has-text('Show More')",
+    "[aria-label='Next page']",
+    "[aria-label='Next']",
+    "[data-automation='pagination-next']",
+    "a:has-text('Next')",
+    "a[rel='next']",
+    "nav[aria-label*='agination'] a:last-child",
+    ".pagination .next a",
+    ".pagination-next a",
+    ".pager-next a",
+    "[class*='pagination'] [class*='next']",
+]
+
+# Cookie/consent banner dismissal (tried once at page load)
+_CONSENT_SELECTORS = [
+    "button:has-text('Accept all')",
+    "button:has-text('Accept cookies')",
+    "button:has-text('Accept')",
+    "button:has-text('I agree')",
+    "button:has-text('Agree')",
+    "button:has-text('Got it')",
+    "[aria-label='Accept cookies']",
+    "#onetrust-accept-btn-handler",
+    ".cc-accept",
+    ".cookie-consent-accept",
+]
+
 
 async def _scrape_playwright_async(url: str) -> JobList:
     try:
         from playwright.async_api import async_playwright
     except ImportError:
-        raise RuntimeError("playwright is not installed. Run: pip install playwright && playwright install chromium")
+        raise RuntimeError(
+            "playwright is not installed. Run: pip install playwright && playwright install chromium"
+        )
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True)
-        page = await browser.new_page(extra_http_headers=HEADERS)
+        context = await browser.new_context(
+            extra_http_headers=HEADERS,
+            viewport={"width": 1280, "height": 900},
+        )
+        page = await context.new_page()
         await page.goto(url, wait_until="networkidle", timeout=60_000)
 
-        # Scroll to trigger lazy loading
-        for _ in range(5):
-            await page.evaluate("window.scrollBy(0, window.innerHeight)")
-            await asyncio.sleep(0.5)
-
-        # Handle "Load more" / pagination buttons
-        for _ in range(10):
-            load_more = page.locator(
-                "button:has-text('Load more'), button:has-text('Show more'), "
-                "button:has-text('View more'), a:has-text('Next'), "
-                "[aria-label='Next page'], [data-automation='pagination-next']"
-            )
-            if await load_more.count() > 0:
-                try:
-                    await load_more.first.click()
-                    await page.wait_for_load_state("networkidle", timeout=10_000)
+        # Dismiss cookie/consent banners
+        for sel in _CONSENT_SELECTORS:
+            try:
+                btn = page.locator(sel)
+                if await btn.count() > 0:
+                    await btn.first.click(timeout=3_000)
                     await asyncio.sleep(0.5)
-                except Exception:
                     break
-            else:
+            except Exception:
+                pass
+
+        # Initial scroll to trigger lazy loading
+        for _ in range(8):
+            await page.evaluate("window.scrollBy(0, window.innerHeight)")
+            await asyncio.sleep(0.4)
+
+        # Paginate: click next/load-more up to 50 times
+        for _page_num in range(50):
+            html_before = await page.content()
+            jobs_before = len(_parse_html_jobs(html_before, url))
+
+            clicked = False
+            for sel in _PAGINATION_SELECTORS:
+                try:
+                    btn = page.locator(sel)
+                    if await btn.count() > 0 and await btn.first.is_visible():
+                        await btn.first.scroll_into_view_if_needed()
+                        await btn.first.click(timeout=5_000)
+                        try:
+                            await page.wait_for_load_state("networkidle", timeout=10_000)
+                        except Exception:
+                            await asyncio.sleep(1.5)
+                        # Scroll new content into view
+                        for _ in range(4):
+                            await page.evaluate("window.scrollBy(0, window.innerHeight)")
+                            await asyncio.sleep(0.3)
+                        clicked = True
+                        break
+                except Exception:
+                    continue
+
+            if not clicked:
                 break
+
+            # Stop if no new jobs loaded after pagination click
+            html_after = await page.content()
+            jobs_after = len(_parse_html_jobs(html_after, url))
+            if jobs_after <= jobs_before:
+                log.debug("Playwright pagination: no new jobs after click, stopping")
+                break
+
+            log.debug("Playwright pagination page %d: %d jobs so far", _page_num + 1, jobs_after)
 
         html = await page.content()
         await browser.close()
@@ -288,25 +542,29 @@ def _scrape_playwright(url: str) -> JobList:
 # ---------------------------------------------------------------------------
 
 def scrape_job_detail(job_url: str) -> str:
-    """Fetch the full description of a single job posting."""
+    """Fetch and extract the full description of a single job posting."""
+    html: str | None = None
     try:
         with httpx.Client(headers=HEADERS, timeout=30, follow_redirects=True) as client:
             resp = client.get(job_url)
-            resp.raise_for_status()
-            html = resp.text
+            # Fall back to Playwright on bot-protection responses
+            if resp.status_code in (403, 429):
+                html = _get_html_playwright(job_url)
+            else:
+                resp.raise_for_status()
+                html = resp.text
     except Exception:
-        # Fall back to Playwright
         html = _get_html_playwright(job_url)
 
     soup = BeautifulSoup(html, "html.parser")
-
-    # Remove nav / header / footer noise
     for tag in soup.select("nav, header, footer, script, style, [role='navigation']"):
         tag.decompose()
 
-    # Common job-detail content selectors
     for sel in [
         "[class*='job-description']",
+        "[id*='job-description']",
+        "[class*='posting-details']",
+        "[class*='job-details']",
         "[class*='description']",
         "[id*='description']",
         "article",
@@ -345,24 +603,48 @@ def scrape_jobs(url: str) -> JobList:
     Detection order:
       1. Greenhouse API
       2. Lever API
-      3. Static HTML (httpx + BS4)
-      4. Playwright (JS-rendered)
+      3. Workday CX API
+      4. Ashby API
+      5. SmartRecruiters API
+      6. Static HTML (httpx + BS4)
+      7. Playwright (JS-rendered, full pagination)
     """
     slug = _is_greenhouse(url)
     if slug:
-        return _scrape_greenhouse(slug)
+        log.debug("Detected Greenhouse: %s", slug)
+        return _retry(_scrape_greenhouse, slug)
 
     slug = _is_lever(url)
     if slug:
-        return _scrape_lever(slug)
+        log.debug("Detected Lever: %s", slug)
+        return _retry(_scrape_lever, slug)
 
-    # Try static first; fall back to Playwright if too few jobs found
+    wd = _is_workday(url)
+    if wd:
+        tenant, base, job_path = wd
+        log.debug("Detected Workday: tenant=%s path=%s", tenant, job_path)
+        return _retry(_scrape_workday, tenant, base, job_path)
+
+    slug = _is_ashby(url)
+    if slug:
+        log.debug("Detected Ashby: %s", slug)
+        return _retry(_scrape_ashby, slug)
+
+    slug = _is_smartrecruiters(url)
+    if slug:
+        log.debug("Detected SmartRecruiters: %s", slug)
+        return _retry(_scrape_smartrecruiters, slug)
+
+    # Generic: try static first, fall back to Playwright
     try:
         jobs = _scrape_static(url)
-    except Exception:
+        log.debug("Static scrape: %d jobs", len(jobs))
+    except Exception as exc:
+        log.warning("Static scrape failed (%s), falling back to Playwright", exc)
         jobs = []
 
     if len(jobs) < 3:
+        log.debug("Too few jobs from static (%d), trying Playwright", len(jobs))
         jobs = _scrape_playwright(url)
 
     return jobs
