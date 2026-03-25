@@ -103,13 +103,40 @@ List all jobs in Berlin at Contentful.
 
 ---
 
+## Docker
+
+### Build
+
+```bash
+docker build -t cairn .
+```
+
+### Register with Claude Code (Docker)
+
+Claude Code communicates over stdio, so pass `-i` to keep stdin open:
+
+```bash
+claude mcp add cairn -- docker run -i --rm cairn
+```
+
+### Run manually (for testing)
+
+```bash
+docker run -i --rm cairn
+```
+
+---
+
 ## Project Structure
 
 ```
 cairn/
-├── main.py      # MCP server — tool registration and entry point
-├── scraper.py   # Careers page scraper (Greenhouse API, Lever API, httpx, Playwright)
-├── parser.py    # Normalisation, deduplication, grouping, and filtering
+├── main.py          # MCP server — tool registration and entry point
+├── scraper.py       # Careers page scraper (Greenhouse API, Lever API, httpx, Playwright)
+├── parser.py        # Normalisation, deduplication, grouping, and filtering
+├── Dockerfile
+├── requirements.txt
+├── .dockerignore
 └── README.md
 ```
 
