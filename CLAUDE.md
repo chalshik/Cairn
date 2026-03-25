@@ -50,25 +50,33 @@ parser.py    — Normalisation, deduplication, filtering
 
 `filter_jobs` accepts both the full `ScrapeResult` object and a bare jobs array.
 
-## Running Locally
+## Running
+
+### One command (recommended)
 
 ```bash
-# Install deps
-pip install mcp httpx beautifulsoup4 playwright
-playwright install chromium
-
-# Register with Claude Code (stdio)
-claude mcp add cairn -- python main.py
-
-# Run as HTTP+SSE server
-CAIRN_TRANSPORT=sse CAIRN_PORT=8000 python main.py
+./setup.sh          # build, start, register with Claude Code
+./setup.sh 9000     # custom port
+./setup.sh stop     # stop
+./setup.sh restart  # restart
+./setup.sh logs     # follow logs
 ```
 
-## Docker
+`setup.sh` builds the image, starts the container, waits for the health check to pass, then registers the MCP server with Claude Code automatically.
+
+### Manual Docker
 
 ```bash
-docker compose up --build
+docker compose up -d --build
 claude mcp add --transport sse cairn http://localhost:8000/sse
+```
+
+### Local (no Docker)
+
+```bash
+pip install mcp httpx beautifulsoup4 playwright
+playwright install chromium
+claude mcp add cairn -- python main.py
 ```
 
 ## Adding a New Platform
