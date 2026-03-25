@@ -1,6 +1,31 @@
-.venv
+# Version control
+.git
+.gitignore
+
+# Python cache
 __pycache__
 *.pyc
 *.pyo
-.git
-.env
+*.pyd
+*.egg-info
+
+# Virtual environments
+.venv
+venv
+env
+
+# Dev / editor
+.vscode
+.idea
+*.env
+.env*
+
+# Docs & meta (not needed at runtime)
+README.md
+CLAUDE.md
+
+# Test artefacts
+tool-results/
+*.jsonl
+*.log
+*.tmp
