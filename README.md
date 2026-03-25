@@ -103,13 +103,52 @@ List all jobs in Berlin at Contentful.
 
 ---
 
+## Docker
+
+Inside the container Cairn runs as an **HTTP+SSE server** on port 8000,
+so it stays alive and accepts connections like a real service.
+
+### Start with Docker Compose (recommended)
+
+```bash
+docker compose up --build
+```
+
+The server will be available at `http://localhost:8000/sse`.
+
+### Or build and run manually
+
+```bash
+docker build -t cairn .
+docker run -p 8000:8000 cairn
+```
+
+### Register with Claude Code (SSE transport)
+
+```bash
+claude mcp add --transport sse cairn http://localhost:8000/sse
+```
+
+### Use stdio transport instead (no HTTP)
+
+If you prefer the original stdio mode (process managed by Claude Code):
+
+```bash
+claude mcp add cairn -- docker run -i --rm -e CAIRN_TRANSPORT=stdio cairn
+```
+
+---
+
 ## Project Structure
 
 ```
 cairn/
-├── main.py      # MCP server — tool registration and entry point
-├── scraper.py   # Careers page scraper (Greenhouse API, Lever API, httpx, Playwright)
-├── parser.py    # Normalisation, deduplication, grouping, and filtering
+├── main.py          # MCP server — tool registration and entry point
+├── scraper.py       # Careers page scraper (Greenhouse API, Lever API, httpx, Playwright)
+├── parser.py        # Normalisation, deduplication, grouping, and filtering
+├── Dockerfile
+├── requirements.txt
+├── .dockerignore
 └── README.md
 ```
 
